@@ -1,0 +1,196 @@
+name: Auto-Release CLI on Push to Main
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write  # Permission for creating and merging PRs
+jobs:
+  release:
+    if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')"
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.new_version.outputs.new_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+
+      - name: Run Tests
+        run: go test ./...
+
+      - name: Check for changelog script
+        run: test -f generate-changelog.sh || (echo "generate-changelog.sh not found!" && exit 1)
+
+      - name: Generate Changelog
+        run: chmod +x generate-changelog.sh && ./generate-changelog.sh
+
+      - name: Commit updated changelog
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          git add CHANGELOG.md
+          if git diff --staged --quiet; then
+            echo "No changes to CHANGELOG.md"
+          else
+            git commit -m "docs: update CHANGELOG.md"
+            git push origin ${{ github.ref_name }}
+          fi
+
+      - name: Get previous tag
+        id: previous_tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.1")
+          echo "previous_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Increment version and ensure unique tag
+        id: new_version
+        run: |
+          PREV_TAG=${{ steps.previous_tag.outputs.previous_tag }}
+          VERSION=$(echo $PREV_TAG | sed 's/^v//')
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+
+          if echo "$COMMIT_MSG" | grep -qi "BREAKING CHANGE"; then
+            NEW_VERSION=$(echo $VERSION | awk -F. '{print $1+1".0.0"}')
+          elif echo "$COMMIT_MSG" | grep -qi "^feat:"; then
+            NEW_VERSION=$(echo $VERSION | awk -F. '{print $1"."$2+1".0"}')
+          else
+            NEW_VERSION=$(echo $VERSION | awk -F. '{print $1"."$2"."$3+1}')
+          fi
+
+          NEW_TAG="v$NEW_VERSION"
+          while git rev-parse "$NEW_TAG" >/dev/null 2>&1; do
+            echo "Tag $NEW_TAG already exists, incrementing patch version..."
+            NEW_VERSION=$(echo $NEW_VERSION | awk -F. '{print $1"."$2"."$3+1}')
+            NEW_TAG="v$NEW_VERSION"
+          done
+
+          echo "New unique version: $NEW_TAG"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create new tag
+        run: |
+          git tag ${{ steps.new_version.outputs.new_tag }}
+          git push origin ${{ steps.new_version.outputs.new_tag }}
+
+      - name: Ensure clean Git state
+        run: |
+          git reset --hard
+          git clean -fd
+          rm -rf dist
+
+      - name: Create build matrix
+        id: build_matrix
+        run: |
+          echo "platforms<<EOF" >> $GITHUB_OUTPUT
+          echo '["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64", "windows/amd64"]' >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  build:
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+
+      - name: Build binary
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags "-s -w -X main.version=${{ needs.release.outputs.new_tag }} -X main.commit=${{ github.sha }} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o instance-manager-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/main.go
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: instance-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  create_release:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Verify tag exists
+        run: |
+          TAG=${{ needs.release.outputs.new_tag }}
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG not found, waiting..."
+            sleep 10
+            git fetch --tags
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG still not found after fetch"
+              exit 1
+            fi
+          fi
+          echo "Tag $TAG found"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: BerryBytes/instance-manager
+          tag_name: ${{ needs.release.outputs.new_tag }}
+          name: Release ${{ needs.release.outputs.new_tag }}
+          body: |
+            ## Changes
+            See CHANGELOG.md for details.
+
+            ## Downloads
+            - Linux AMD64
+            - Linux ARM64
+            - macOS AMD64
+            - macOS ARM64
+            - Windows AMD64
+          files: ./artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
