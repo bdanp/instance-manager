@@ -1,6 +1,6 @@
 # Instance Manager
 
-A Go-based CLI tool for managing compute instances with automatic lifecycle management.
+A Go-based command-line interface (CLI) tool for managing compute instances with automatic lifecycle management. The manager is extensible and supports a wide range of NeoCloud and leading cloud providers. The default implementation is specifically designed for AWS.  
 
 ## Features
 
@@ -242,3 +242,4 @@ Enable verbose logging:
 - [ ] Volume encryption options
 - [ ] Leveraging the spot instances.
 - [ ] Support for K8s as GPU Pods as instance
+- [ ] Use relational database instead of flat json based database to store the instance state. 
